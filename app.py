@@ -8,6 +8,7 @@ app = Flask(__name__)
 # Constants
 RESULTS_PER_PAGE = 25
 CACHE_EXPIRATION = 500
+LOW_SCORE_THRESHOLD = 100000  # New constant for vote-off calculation
 
 # Cache variables
 cached_leaderboard = None
@@ -46,6 +47,11 @@ def process_leaderboard(leaderboard, sort_by="highScore", ascending=False, tribe
 
     df = pd.DataFrame(leaderboard)
 
+    # Handle playerAddress for compatibility with existing code
+    if 'playerAddress' in df.columns and 'address' not in df.columns:
+        # Rename the column instead of creating a duplicate
+        df = df.rename(columns={'playerAddress': 'address'})
+
     # Convert highScoreAchievedAt to time-only format (HH:MM AM/PM)
     if 'highScoreAchievedAt' in df.columns:
         df['highScoreAchievedAt'] = df['highScoreAchievedAt'].apply(
@@ -67,32 +73,39 @@ def process_leaderboard(leaderboard, sort_by="highScore", ascending=False, tribe
 
     return df_paginated, total_results
 
-def calculate_team_leaderboard():
-    global cached_leaderboard
+def calculate_tribe_stats(tribe):
+    # Get the full dataset
+    full_data = fetch_leaderboard()
+    if not full_data or len(full_data) == 0:
+        return "0% (0/0)", "0"
 
-    # If the cached leaderboard is empty or None, return an empty DataFrame
-    if not cached_leaderboard or len(cached_leaderboard) == 0:
-        return pd.DataFrame(columns=["tribe", "highest_score", "average_score"])
+    # Convert to DataFrame
+    df = pd.DataFrame(full_data)
 
-    df = pd.DataFrame(cached_leaderboard)
+    # Check if "tribe" column exists
+    if "tribe" not in df.columns:
+        return "0% (0/0)", "0"
 
-    # Group by tribe and calculate the highest individual score per team
-    team_stats = df.groupby("tribe").agg(
-        highest_score=("highScore", "max"),  # Highest individual score
-        average_score=("highScore", "mean")  # Average score across tribe
-    ).reset_index()
+    # Filter by tribe
+    df = df[df["tribe"] == tribe]
 
-    # Format the scores nicely
-    team_stats["highest_score"] = team_stats["highest_score"].apply(lambda x: f"{x:,.0f}" if not pd.isna(x) else "0")
-    team_stats["average_score"] = team_stats["average_score"].apply(lambda x: f"{x:,.0f}" if not pd.isna(x) else "0")
+    # If no players in this tribe, return safe values
+    if df.empty:
+        return "0% (0/0)", "0"
 
-    # Sort teams by highest individual score (descending)
-    team_stats = team_stats.sort_values(by="highest_score", ascending=False)
+    # Count players
+    total_players = len(df)
+    players_with_score = df[df["highScore"] > 0].shape[0]
 
-    return team_stats
+    # Calculate percentage of players with a score
+    percentage_scored = (players_with_score / total_players) * 100 if total_players > 0 else 0
+    percentage_text = f"{percentage_scored:.1f}% ({players_with_score}/{total_players})"
 
+    # Calculate average score (even if some players have 0)
+    average_score = df["highScore"].mean()
+    average_score_text = f"{average_score:,.0f}" if not pd.isna(average_score) else "0"
 
-
+    return percentage_text, average_score_text
 
 # Define hardcoded tribe colors (10% opacity for rows, 100% for buttons)
 tribe_colors = {
@@ -138,8 +151,6 @@ def generate_sort_buttons(base_url):
     return f'''
         <a href="{base_url}?sort_by=highScore&order=asc" class="btn btn-secondary">Sort by High Score (Asc)</a>
         <a href="{base_url}?sort_by=highScore&order=desc" class="btn btn-secondary">Sort by High Score (Desc)</a>
-        <a href="{base_url}?sort_by=attempts&order=asc" class="btn btn-secondary">Sort by Attempts (Asc)</a>
-        <a href="{base_url}?sort_by=attempts&order=desc" class="btn btn-secondary">Sort by Attempts (Desc)</a>
     '''
 
 def calculate_team_leaderboard():
@@ -164,7 +175,32 @@ def calculate_team_leaderboard():
 
     return team_stats
 
+def calculate_vote_off_list(tribe):
+    full_data = fetch_leaderboard()  # Get the full leaderboard
+    if not full_data:
+        return []
 
+    df = pd.DataFrame(full_data)
+
+    # Ensure required columns exist
+    address_col = "playerAddress" if "playerAddress" in df.columns else "address"
+    if "tribe" not in df.columns or address_col not in df.columns:
+        return []
+
+    # Filter by tribe
+    df = df[df["tribe"] == tribe]
+
+    # Find players with scores below threshold (0 or less than 100,000)
+    df = df[df["highScore"] < LOW_SCORE_THRESHOLD]
+
+    # Sort by score (ascending)
+    df = df.sort_values(by="highScore", ascending=True)
+
+    # Extract player IDs safely
+    df["player_id"] = df[address_col].apply(lambda x: x.split(":")[-1] if ":" in str(x) else "Unknown")
+
+    # Create a list of tuples with player_id and highScore
+    return [(player, score) for player, score in zip(df["player_id"].tolist(), df["highScore"].tolist())]
 
 # Main leaderboard route
 @app.route('/')
@@ -195,13 +231,17 @@ def leaderboard():
     </head>
     <body>
         <div class="container">
-            <h1 class="mt-4 mb-4">Live Leaderboard</h1><br>
-             <a href="/teams" class="btn btn-info">View Team Leaderboard</a><br>
+        <div class="d-flex flex-wrap align-items-center">
+            <h1 class="mt-4 mb-4">Individual Leaderboard</h1><br>
+             <a href="/teams" class="btn btn-info ml-4">View Team Leaderboard</a><br>
+             </div>
+             <h3>Tribe Leaderboards</h3>
             {tribe_buttons}
-            <h4>Sorted by {sort_by} ({order.upper()})</h4>
-            <p><small>Last Updated: {time.strftime('%I:%M %p', time.localtime(last_updated))}</small></p>
+            <div class="d-flex flex-wrap align-items-center justify-content-end">
+            <div class="mr-2"><small>Last Updated: {time.strftime('%I:%M %p', time.localtime(last_updated))}</small></div>
             <div>
-                <a href="/" class="btn btn-success">Manual Refresh</a>
+                <a href="/" class="btn btn-success">Refresh</a>
+            </div>
             </div>
             <br>
             {table_html}
@@ -229,6 +269,9 @@ def tribe_leaderboard(tribe):
     # Get full tribe stats BEFORE pagination
     percentage_scored, average_score = calculate_tribe_stats(tribe)
 
+    # Get the vote-off list
+    vote_off_list = calculate_vote_off_list(tribe)
+
     # Apply sorting and pagination
     df_sorted, total_results = process_leaderboard(data, sort_by, ascending, tribe, page)
 
@@ -249,19 +292,49 @@ def tribe_leaderboard(tribe):
         <link href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css" rel="stylesheet">
         <a href="/" class="btn btn-dark">Back to Main Leaderboard</a>
         <title>{tribe.capitalize()} Tribe Leaderboard</title>
+        <!-- Add Bootstrap and jQuery -->
+        <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+        <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.bundle.min.js"></script>
     </head>
     <body>
         <div class="container">
             <h1 class="mt-4 mb-4">{tribe.capitalize()} Tribe Leaderboard</h1>
             {tribe_buttons}
+            <div class="d-flex flex-wrap align-items-center justify-content-between">
+            <div>
             <h4>Sorted by {sort_by} ({order.upper()})</h4>
             <h5>Percentage of Players with a Score > 0: {percentage_scored}</h5>
             <h5>Average Score (All Players): {average_score}</h5>
+            </div>
+            <button type="button" class="btn btn-danger mt-3" data-toggle="modal" data-target="#voteOffModal">
+                Who Should I Vote Off?
+            </button>
+            </div>
             <br>
             {sort_buttons}
             <br><br>
             {table_html}
             <br>
+            <div class="modal fade" id="voteOffModal" tabindex="-1" role="dialog" aria-labelledby="voteOffModalLabel" aria-hidden="true">
+                <div class="modal-dialog" role="document">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h5 class="modal-title" id="voteOffModalLabel">Players with Low Scores (< {LOW_SCORE_THRESHOLD:,})</h5>
+                            <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+                                <span aria-hidden="true">&times;</span>
+                            </button>
+                        </div>
+                        <div class="modal-body">
+                            <ul class="list-group">
+                                {"".join(f'<li class="list-group-item">Player {player} - Score: {score:,}</li>' for player, score in vote_off_list) if vote_off_list else "<p>No players with low scores.</p>"}
+                            </ul>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" data-dismiss="modal">Close</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
     </body>
     </html>
@@ -307,10 +380,6 @@ def team_leaderboard():
     </html>
     '''
     return render_template_string(html)
-
-
-
-
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
